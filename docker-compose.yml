@@ -1,0 +1,12 @@
+services:
+  falkordb:
+    image: falkordb/falkordb:latest
+    ports:
+      - "6379:6379"
+    volumes:
+      - falkor-data:/data
+    # Browser UI available via the FalkorDB Browser (separate download) or
+    # redis://localhost:6379 in any Redis client.
+
+volumes:
+  falkor-data:

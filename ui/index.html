@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RecallGraph -- the agent that never forgets</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --user-bubble: #1f6feb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    padding: 12px 16px; background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  header h1 { margin: 0; font-size: 1.3rem; }
+  header .subtitle { color: var(--muted); font-size: 0.9rem; }
+  header label { margin-left: auto; font-size: 0.85rem; color: var(--muted); }
+  header input, header button {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px;
+  }
+  header button { cursor: pointer; }
+  header button:hover { border-color: var(--accent); }
+  #health {
+    font-size: 0.8rem; padding: 4px 10px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--muted);
+  }
+  #health .ok { color: #3fb950; }
+  #health .down { color: #f85149; }
+  #seed-status { font-size: 0.8rem; color: var(--muted); }
+  main { flex: 1; display: flex; min-height: 0; }
+  #chat {
+    flex: 1; overflow-y: auto; padding: 16px;
+    display: flex; flex-direction: column; gap: 12px;
+    border-right: 1px solid var(--border); min-width: 0;
+  }
+  .msg { max-width: 85%; padding: 10px 14px; border-radius: 12px; line-height: 1.45; }
+  .msg.user {
+    align-self: flex-end; background: var(--user-bubble); color: #fff;
+  }
+  .msg.assistant {
+    align-self: flex-start; background: var(--panel);
+    border: 1px solid var(--border);
+  }
+  .msg.error {
+    align-self: stretch; background: transparent; color: #f85149;
+    border: 1px dashed #f85149; max-width: none;
+  }
+  details.trail { margin-top: 10px; font-size: 0.8rem; }
+  details.trail summary { cursor: pointer; color: var(--accent); }
+  details.trail pre {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px; overflow-x: auto; white-space: pre-wrap;
+  }
+  #viz {
+    width: 660px; max-width: 45vw; padding: 16px; overflow: auto;
+    display: flex; flex-direction: column;
+  }
+  #viz h2 { margin: 0 0 8px; font-size: 0.95rem; color: var(--muted); }
+  #viz svg { border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
+  #composer {
+    display: flex; gap: 8px; padding: 12px 16px;
+    border-top: 1px solid var(--border); background: var(--panel);
+  }
+  #composer input {
+    flex: 1; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px;
+    font-size: 1rem;
+  }
+  #composer button {
+    background: var(--user-bubble); color: #fff; border: none;
+    border-radius: 8px; padding: 10px 20px; font-size: 1rem; cursor: pointer;
+  }
+  #composer button:disabled { opacity: 0.5; cursor: default; }
+</style>
+</head>
+<body>
+<header>
+  <h1>RecallGraph</h1>
+  <span class="subtitle">the agent that never forgets</span>
+  <label>Tenant <input id="tenant" value="demo" pattern="[a-z0-9_-]{1,32}"></label>
+  <button id="seed-btn" type="button">Seed demo data</button>
+  <span id="seed-status"></span>
+  <span id="health">health: ...</span>
+</header>
+<main>
+  <section id="chat" aria-label="chat"></section>
+  <section id="viz" aria-label="graph">
+    <h2>Memory graph</h2>
+    <svg id="viz-svg" width="640" height="360" viewBox="0 0 640 360"></svg>
+  </section>
+</main>
+<form id="composer">
+  <input id="message" placeholder="Ask the agent..." autocomplete="off">
+  <button id="send-btn" type="submit">Send</button>
+</form>
+<script>
+(function () {
+  "use strict";
+  var chatEl = document.getElementById("chat");
+  var vizSvg = document.getElementById("viz-svg");
+  var tenantEl = document.getElementById("tenant");
+  var msgEl = document.getElementById("message");
+  var sendBtn = document.getElementById("send-btn");
+  var healthEl = document.getElementById("health");
+  var seedBtn = document.getElementById("seed-btn");
+  var seedStatusEl = document.getElementById("seed-status");
+
+  var SVG_NS = "http://www.w3.org/2000/svg";
+  var PALETTE = ["#58a6ff", "#3fb950", "#d29922", "#f778ba", "#a371f7",
+                 "#39c5cf", "#f85149", "#ff9e64"];
+
+  function currentTenant() {
+    return (tenantEl.value || "demo").trim() || "demo";
+  }
+
+  function colorFor(label) {
+    var h = 0, s = String(label || "?");
+    for (var i = 0; i < s.length; i++) {
+      h = (h * 31 + s.charCodeAt(i)) % 1000003;
+    }
+    return PALETTE[h % PALETTE.length];
+  }
+
+  function el(tag, cls, text) {
+    var d = document.createElement(tag);
+    if (cls) d.className = cls;
+    if (text !== undefined && text !== null) d.textContent = text;
+    return d;
+  }
+
+  function addUserBubble(text) {
+    chatEl.appendChild(el("div", "msg user", text));
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+
+  function addErrorBubble(text) {
+    chatEl.appendChild(el("div", "msg error", text));
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+
+  function addAssistantMessage(answer, trail) {
+    var wrap = el("div", "msg assistant");
+    // Escape HTML via textContent; preserve line breaks with <br>.
+    var lines = String(answer == null ? "" : answer).split("\n");
+    for (var i = 0; i < lines.length; i++) {
+      if (i > 0) wrap.appendChild(document.createElement("br"));
+      wrap.appendChild(document.createTextNode(lines[i]));
+    }
+    if (trail) {
+      var det = el("details", "trail");
+      var sum = el("summary", null, "Reasoning trail");
+      det.appendChild(sum);
+      var cap1 = el("div", null, "Cypher:");
+      det.appendChild(cap1);
+      var cy = document.createElement("pre");
+      cy.textContent = trail.cypher || "(no cypher)";
+      det.appendChild(cy);
+      var cap2 = el("div", null, "Matched path:");
+      det.appendChild(cap2);
+      var pt = document.createElement("pre");
+      pt.textContent = trail.path_text || "(empty)";
+      det.appendChild(pt);
+      wrap.appendChild(det);
+    }
+    chatEl.appendChild(wrap);
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+
+  function nodeLabel(node) {
+    var props = (node && node.props) || {};
+    var raw = props.name !== undefined ? props.name
+            : (props.text !== undefined ? props.text : String(node.id));
+    return String(raw).slice(0, 16);
+  }
+
+  function nodeFirstLabel(node) {
+    var labels = (node && node.labels) || [];
+    return labels.length ? labels[0] : "?";
+  }
+
+  function drawGraph(nodes, edges) {
+    while (vizSvg.firstChild) vizSvg.removeChild(vizSvg.firstChild);
+    nodes = (nodes || []).slice(0, 60);
+    edges = edges || [];
+    var W = 640, H = 360, cx = W / 2, cy = H / 2, R = 140;
+    var pos = {};
+    var n = nodes.length;
+    for (var i = 0; i < n; i++) {
+      var a = (2 * Math.PI * i) / Math.max(1, n) - Math.PI / 2;
+      var x = cx + R * Math.cos(a), y = cy + R * Math.sin(a);
+      if (n === 1) { x = cx; y = cy; }
+      pos[String(nodes[i].id)] = [x, y];
+    }
+    var i2;
+    for (i2 = 0; i2 < edges.length; i2++) {
+      var e = edges[i2];
+      var p1 = pos[String(e.src)], p2 = pos[String(e.dst)];
+      if (!p1 || !p2) continue;
+      var line = document.createElementNS(SVG_NS, "line");
+      line.setAttribute("x1", p1[0]); line.setAttribute("y1", p1[1]);
+      line.setAttribute("x2", p2[0]); line.setAttribute("y2", p2[1]);
+      line.setAttribute("stroke", "#6e7681");
+      line.setAttribute("stroke-width", "1");
+      vizSvg.appendChild(line);
+    }
+    for (i2 = 0; i2 < n; i2++) {
+      var node = nodes[i2];
+      var p = pos[String(node.id)];
+      var label = nodeFirstLabel(node);
+      var c = document.createElementNS(SVG_NS, "circle");
+      c.setAttribute("cx", p[0]); c.setAttribute("cy", p[1]);
+      c.setAttribute("r", "14");
+      c.setAttribute("fill", colorFor(label));
+      c.setAttribute("stroke", "#0d1117");
+      c.setAttribute("stroke-width", "2");
+      vizSvg.appendChild(c);
+      var t = document.createElementNS(SVG_NS, "text");
+      t.setAttribute("x", p[0]); t.setAttribute("y", p[1] + 26);
+      t.setAttribute("text-anchor", "middle");
+      t.setAttribute("fill", "#e6edf3");
+      t.setAttribute("font-size", "10");
+      t.textContent = nodeLabel(node);
+      vizSvg.appendChild(t);
+    }
+    if (!n) {
+      var empty = document.createElementNS(SVG_NS, "text");
+      empty.setAttribute("x", cx); empty.setAttribute("y", cy);
+      empty.setAttribute("text-anchor", "middle");
+      empty.setAttribute("fill", "#8b949e");
+      empty.setAttribute("font-size", "12");
+      empty.textContent = "(empty graph)";
+      vizSvg.appendChild(empty);
+    }
+  }
+
+  function postJson(url, body) {
+    return fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (resp) {
+      return resp.json().catch(function () { return {}; }).then(function (data) {
+        if (!resp.ok) {
+          var msg = (data && data.detail) || ("HTTP " + resp.status);
+          throw new Error(String(msg));
+        }
+        return data;
+      });
+    });
+  }
+
+  function loadHealth() {
+    fetch("/health").then(function (resp) {
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      return resp.json();
+    }).then(function (h) {
+      var f = h.falkordb === "ok", l = h.llm === "ok";
+      healthEl.innerHTML = "";
+      healthEl.appendChild(document.createTextNode("falkordb: "));
+      var fs = el("span", f ? "ok" : "down", f ? "ok" : "down");
+      healthEl.appendChild(fs);
+      healthEl.appendChild(document.createTextNode(", llm: "));
+      var ls = el("span", l ? "ok" : "down", l ? "ok" : "down");
+      healthEl.appendChild(ls);
+    }).catch(function () {
+      healthEl.textContent = "health: unreachable";
+    });
+  }
+
+  function loadGraphViz() {
+    var url = "/graph?tenant=" + encodeURIComponent(currentTenant()) + "&limit=60";
+    fetch(url).then(function (resp) {
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      return resp.json();
+    }).then(function (g) {
+      drawGraph(g.nodes, g.edges);
+    }).catch(function (err) {
+      addErrorBubble("Could not load graph viz: " + err.message);
+    });
+  }
+
+  seedBtn.addEventListener("click", function () {
+    seedBtn.disabled = true;
+    seedStatusEl.textContent = "seeding...";
+    postJson("/seed", {}).then(function (data) {
+      seedStatusEl.textContent = "seed: " + (data.status || "ok");
+      loadGraphViz();
+    }).catch(function (err) {
+      seedStatusEl.textContent = "seed failed";
+      addErrorBubble("Seed failed: " + err.message);
+    }).then(function () {
+      seedBtn.disabled = false;
+    });
+  });
+
+  tenantEl.addEventListener("change", loadGraphViz);
+
+  document.getElementById("composer").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var text = (msgEl.value || "").trim();
+    if (!text) return;
+    addUserBubble(text);
+    msgEl.value = "";
+    sendBtn.disabled = true;
+    postJson("/chat", { tenant: currentTenant(), message: text }).then(function (data) {
+      addAssistantMessage(data.answer, data.trail);
+      var trail = data.trail || {};
+      drawGraph(trail.nodes, trail.edges);
+    }).catch(function (err) {
+      addErrorBubble("Chat failed: " + err.message);
+    }).then(function () {
+      sendBtn.disabled = false;
+      msgEl.focus();
+    });
+  });
+
+  loadHealth();
+  loadGraphViz();
+})();
+</script>
+</body>
+</html>
